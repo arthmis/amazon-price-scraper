@@ -1,0 +1,18 @@
+[package]
+name = "web_scraping_rust"
+version = "0.1.0"
+authors = []
+
+[dependencies]
+scraper = "0.8.1"
+reqwest = "0.9.5"
+prettytable-rs = "0.8.0"
+textwrap = "0.10.0"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = "z"
+debug = false
+lto = true
