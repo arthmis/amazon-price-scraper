@@ -3,6 +3,7 @@ extern crate scraper;
 #[macro_use]
 extern crate prettytable;
 extern crate textwrap;
+extern crate url;
 
 
 use prettytable::{Table, Row, Cell};
@@ -11,6 +12,9 @@ use scraper::{Html, Selector};
 
 use std::fs::File;
 use std::io::{BufReader, BufRead};
+use std::process::Command;
+
+use url::Url;
 
 
 #[derive(Debug, Clone)]
@@ -21,13 +25,21 @@ struct Product {
 
 fn main() {
 
-    let mut urls: Vec<String> = Vec::new(); 
-    let mut amazon_urls_file = File::open("amazon_product_urls.txt")
+    // let output = Command::new("gnome-terminal")
+    //                  .arg("&")
+    //                  .arg("disown")
+    //                  .spawn()
+    //                  .expect("Failed to execute command");
+
+    let mut urls: Vec<Url> = Vec::new(); 
+    let amazon_urls_file = File::open("amazon_product_urls.txt")
         .expect("file not found");  
     for line in BufReader::new(amazon_urls_file).lines() {
-        // println!("{}", line.expect("line not found"));
-        urls.push(line.expect("line couldn't be read"));
-
+        let possible_url = Url::parse(&line.expect("line couldn't be read"));
+        match possible_url {
+            Ok(url) => urls.push(url),
+            Err(error) => println!("couldn't parse url: {}\n", error),
+        }
     }
 
     let products = get_product_details(urls);
@@ -45,11 +57,12 @@ fn main() {
     
 }
 
-fn get_product_details(urls: Vec<String>) -> Vec<Product> {
+fn get_product_details(urls: Vec<Url>) -> Vec<Product> {
     let mut products: Vec<Product> = Vec::new();
 
     for url in urls {    
-        let html = reqwest::get(&url).expect("couldn't get website").text() 
+        let html = reqwest::get(url.as_str())
+            .expect("couldn't get website").text() 
             .expect("couldn't convert html to string");
         let document = Html::parse_document(&html);
         let price_selector = Selector::parse("#priceblock_ourprice")
@@ -78,7 +91,7 @@ fn get_product_details(urls: Vec<String>) -> Vec<Product> {
                 let deal_price = document.select(&dealprice_selector).next();
                 match deal_price {
                     Some(price) => product.price = price.inner_html(),
-                    None => product.price = "price not found".to_string(),
+                    None => product.price = "Sold Out".to_string(),
                 }; 
             },
         };
