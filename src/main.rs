@@ -1,11 +1,13 @@
 use anyhow::{Context, Error, Result};
+use async_std::future;
 use prettytable::Table;
 use prettytable::{cell, row};
 use scraper::{Html, Selector};
 use textwrap::fill;
 
-use std::fs::File;
+use futures::future::join_all;
 use std::io::{BufRead, BufReader};
+use std::{fs::File, time::Duration};
 
 use url::Url;
 
@@ -27,7 +29,7 @@ async fn main() -> Result<(), Error> {
         }
     }
 
-    let products = get_product_details(urls).await?;
+    let products = future::timeout(Duration::from_secs(10), get_product_details(urls)).await??;
 
     let mut my_table = Table::new();
     my_table.add_row(row!["Title", "Price"]);
@@ -40,17 +42,31 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
+async fn request(url: Url) -> Result<String, Error> {
+    Ok(reqwest::get(url.as_str())
+        .await
+        .with_context(|| "couldn't get website")?
+        .text()
+        .await
+        .with_context(|| "couldn't convert html to string")?)
+}
+
 async fn get_product_details(urls: Vec<Url>) -> Result<Vec<Product>, Error> {
     let mut products: Vec<Product> = Vec::new();
 
+    let mut futures = vec![];
+    let mut product_pages = Vec::new();
     for url in urls {
-        let html = reqwest::get(url.as_str())
-            .await
-            .with_context(|| "couldn't get website")?
-            .text()
-            .await
-            .with_context(|| "couldn't convert html to string")?;
-        let document = Html::parse_document(&html);
+        futures.push(async_std::task::spawn(request(url)));
+    }
+    let documents = join_all(futures).await;
+
+    for document in documents {
+        let html = Html::parse_document(&document?);
+        product_pages.push(html);
+    }
+
+    for document in product_pages {
         let price_selector =
             Selector::parse("#priceblock_ourprice").expect("couldn't parse css price id selector");
         let title_selector =
@@ -86,7 +102,7 @@ async fn get_product_details(urls: Vec<Url>) -> Result<Vec<Product>, Error> {
                     None => product.price = "Sold Out".to_string(),
                 };
             }
-        };
+        }
         products.push(product);
     }
     Ok(products)
