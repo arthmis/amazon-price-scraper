@@ -6,9 +6,8 @@ use prettytable::{cell, row};
 use scraper::{Html, Selector};
 use textwrap::fill;
 
-use futures::{future::join_all, Future};
+use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::{fs::File, time::Duration};
 
 use url::Url;
 
@@ -20,6 +19,7 @@ use cdrs_tokio::{
     cluster::{ClusterTcpConfig, NodeTcpConfigBuilder, TcpConnectionsManager},
     query::QueryExecutor,
 };
+use reqwest::ClientBuilder;
 
 pub mod db;
 #[derive(Debug, Clone)]
@@ -41,7 +41,8 @@ async fn main() -> Result<(), Error> {
 
     let products: Vec<Product> = {
         // let products = timeout(Duration::from_secs(10), get_product_details(urls)).await??;
-        let products = get_products(urls).await?;
+        // let products = get_products(&urls).await?;
+        let products = get_products(&urls[..1]).await?;
         dbg!(&products);
         products
     };
@@ -74,7 +75,7 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
-async fn get_products(urls: Vec<Url>) -> Result<Vec<Product>, Error> {
+async fn get_products(urls: &[Url]) -> Result<Vec<Product>, Error> {
     let mut products: Vec<Product> = Vec::new();
 
     for url in urls.iter() {
@@ -85,11 +86,52 @@ async fn get_products(urls: Vec<Url>) -> Result<Vec<Product>, Error> {
 }
 
 async fn get_product_detail(url: Url) -> Result<Product, Error> {
-    let document = surf::get(url.clone()).recv_string().await.unwrap();
+    let client = {
+        let mut client = reqwest::ClientBuilder::new();
+        client = client.user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:84.0) Gecko/20100101 Firefox/84.0",
+        );
+        let headers = {
+            use reqwest::header;
+            use reqwest::header::HeaderValue;
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                header::ACCEPT,
+                HeaderValue::from_str(
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                )?,
+            );
+            headers.insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_str("gzip, deflate, br")?,
+            );
+            headers.insert(
+                header::ACCEPT_LANGUAGE,
+                HeaderValue::from_str("en-US,en;q=0.5")?,
+            );
+            headers.insert(header::CACHE_CONTROL, HeaderValue::from_str("no-cache")?);
+            headers.insert(header::CONNECTION, HeaderValue::from_str("keep-alive")?);
+            headers.insert(header::DNT, HeaderValue::from_str("1")?);
+            headers.insert(header::HOST, HeaderValue::from_str("www.amazon.com")?);
+            headers.insert(header::PRAGMA, HeaderValue::from_str("no-cache")?);
+            headers.insert(
+                header::UPGRADE_INSECURE_REQUESTS,
+                HeaderValue::from_str("1")?,
+            );
+            headers
+        };
+        client = client.gzip(true);
+        client = client.brotli(true);
+        client = client.cookie_store(true);
+        client = client.default_headers(headers);
+        client = client.use_native_tls();
+        client.build()?
+    };
+    let req = client.get(url).build()?;
+    let res = client.execute(req).await?;
+    let document = res.text_with_charset("utf-8").await?;
 
     let document = document;
-    dbg!(&document);
-    // let document = Html::parse_document(&document?);
     let document = Html::parse_document(&document);
 
     let price_selector =

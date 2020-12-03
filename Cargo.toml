@@ -16,7 +16,7 @@ async-std = {version = "1", features = ["attributes", "tokio03", "tokio02"]}
 futures = "0.3.8"
 cdrs-tokio = "1"
 chrono = "0.4"
-surf = "2.1.0"
+reqwest = { version = "0.10.9", features = ["brotli", "gzip", "native-tls", "cookies"] }
 
 
 [profile.dev]
