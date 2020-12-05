@@ -1,6 +1,8 @@
 #![allow(warnings)]
 use anyhow::{Context, Error, Result};
 use async_std::{future::timeout, task::JoinHandle};
+use bollard::container::{Config, CreateContainerOptions, StartContainerOptions};
+use bollard::service::HostConfig;
 use prettytable::Table;
 use prettytable::{cell, row};
 use scraper::{Html, Selector};
@@ -19,6 +21,7 @@ use cdrs_tokio::{
     cluster::{ClusterTcpConfig, NodeTcpConfigBuilder, TcpConnectionsManager},
     query::QueryExecutor,
 };
+use futures::future::Future;
 use log::{debug, error, info};
 use reqwest::ClientBuilder;
 use simplelog::{LevelFilter, WriteLogger};
@@ -46,6 +49,14 @@ async fn main() -> Result<(), Error> {
             options.open("amazon-price-scraper.log")?
         };
         let _ = WriteLogger::init(LevelFilter::Info, logger_config, log_file)?;
+    }
+    let mut urls: Vec<Url> = Vec::new();
+    let amazon_urls_file = File::open("amazon_product_urls.txt").expect("file not found");
+    for line in BufReader::new(amazon_urls_file).lines() {
+        let possible_url = Url::parse(&line.expect("line couldn't be read"));
+        match possible_url {
+            Ok(url) => urls.push(url),
+            Err(error) => println!("couldn't parse url: {}\n", error),
         }
     }
 
@@ -82,6 +93,60 @@ async fn main() -> Result<(), Error> {
     }
 
     my_table.printstd();
+
+    let docker = bollard::Docker::connect_with_local_defaults()?;
+
+    let container_name = "scylla";
+    match docker.inspect_container(container_name, None).await {
+        // if found then start container
+        Ok(_res) => {
+            // TODO: Container might already be running so handle error
+            // in that case
+            docker
+                .start_container(
+                    container_name,
+                    Some(StartContainerOptions {
+                        detach_keys: "ctrl-^",
+                    }),
+                )
+                .await?;
+        }
+        // if err then create a container and start it
+        Err(err) => {
+            // log error first
+            eprintln!("{}", err);
+
+            let host_config = HostConfig {
+                memory: Some(2_000_000_000),
+                ..Default::default()
+            };
+            let create_container_config: Config<String> = Config {
+                host_config: Some(host_config),
+                image: Some("scylladb/scylla".to_string()),
+                ..Default::default()
+            };
+
+            let res = docker
+                .create_container(
+                    Some(CreateContainerOptions {
+                        name: container_name,
+                    }),
+                    create_container_config,
+                )
+                .await
+                .unwrap();
+
+            docker
+                .start_container(
+                    "scylla",
+                    Some(StartContainerOptions {
+                        detach_keys: "ctrl-^",
+                    }),
+                )
+                .await?;
+        }
+    };
+
     Ok(())
 }
 
