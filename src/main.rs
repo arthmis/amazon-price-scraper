@@ -3,6 +3,7 @@ use anyhow::{Context, Error, Result};
 use async_std::{future::timeout, task::JoinHandle};
 use bollard::container::{Config, CreateContainerOptions, StartContainerOptions};
 use bollard::service::HostConfig;
+use chrono::Local;
 use prettytable::Table;
 use prettytable::{cell, row};
 use scraper::{Html, Selector};
@@ -22,15 +23,17 @@ use cdrs_tokio::{
     query::QueryExecutor,
 };
 use futures::future::Future;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use reqwest::ClientBuilder;
 use simplelog::{LevelFilter, WriteLogger};
 
 pub mod db;
 #[derive(Debug, Clone)]
 struct Product {
-    title: String,
+    name: String,
     price: String,
+    url: Url,
+    time: chrono::DateTime<Local>,
 }
 #[async_std::main]
 async fn main() -> Result<(), Error> {
@@ -68,32 +71,19 @@ async fn main() -> Result<(), Error> {
         products
     };
 
-    let create_ks = "CREATE KEYSPACE IF NOT EXISTS amazon WITH REPLICATION = { \
-                             'class' : 'SimpleStrategy', 'replication_factor' : 1 };";
-
-    let result: Result<(), anyhow::Error> = {
-        let node = NodeTcpConfigBuilder::new("127.0.0.1:9042", NoneAuthenticator {}).build();
-        let cluster_config = ClusterTcpConfig(vec![node]);
-        let session = session::new(&cluster_config, RoundRobin::new()).await?;
-        session
-            .query(create_ks)
-            .await
-            .expect("Keyspace create error");
-        Ok(())
-    };
-    result.unwrap();
-
     dbg!(&products);
 
     let mut my_table = Table::new();
-    my_table.add_row(row!["Title", "Price"]);
+    my_table.add_row(row!["Name", "Price"]);
 
     for product in products {
-        my_table.add_row(row![&fill(&product.title, 65), &fill(&product.price, 15)]);
+        my_table.add_row(row![&fill(&product.name, 65), &fill(&product.price, 15)]);
     }
 
     my_table.printstd();
 
+    // TODO: if docker fails to connect then this should send a desktop notification
+    // which should prompt me to start docker and allow the program to run correctly
     let docker = bollard::Docker::connect_with_local_defaults()?;
 
     let container_name = "scylla";
@@ -110,11 +100,13 @@ async fn main() -> Result<(), Error> {
                     }),
                 )
                 .await?;
+            info!("Starting {} container.", container_name);
         }
         // if err then create a container and start it
         Err(err) => {
             // log error first
-            eprintln!("{}", err);
+            warn!("Potential issue finding container {}.", container_name);
+            error!("{}", err);
 
             let host_config = HostConfig {
                 memory: Some(2_000_000_000),
@@ -136,16 +128,35 @@ async fn main() -> Result<(), Error> {
                 .await
                 .unwrap();
 
+            info!("Creating {} container.", container_name);
+
             docker
                 .start_container(
-                    "scylla",
+                    container_name,
                     Some(StartContainerOptions {
                         detach_keys: "ctrl-^",
                     }),
                 )
                 .await?;
+            info!("Starting {} container.", container_name);
         }
     };
+    // Here goes code to move product data into the database then program should stop container
+    // and close docker down if that is possible
+    let create_ks = "CREATE KEYSPACE IF NOT EXISTS amazon WITH REPLICATION = { \
+                             'class' : 'SimpleStrategy', 'replication_factor' : 1 };";
+
+    let result: Result<(), anyhow::Error> = {
+        let node = NodeTcpConfigBuilder::new("127.0.0.1:9042", NoneAuthenticator {}).build();
+        let cluster_config = ClusterTcpConfig(vec![node]);
+        let session = session::new(&cluster_config, RoundRobin::new()).await?;
+        session
+            .query(create_ks)
+            .await
+            .expect("Keyspace create error");
+        Ok(())
+    };
+    result.unwrap();
 
     Ok(())
 }
@@ -163,9 +174,9 @@ async fn get_products(urls: &[Url]) -> Result<Vec<Product>, Error> {
 async fn get_product_detail(url: Url) -> Result<Product, Error> {
     let client = {
         let mut client = reqwest::ClientBuilder::new();
-        client = client.user_agent(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:84.0) Gecko/20100101 Firefox/84.0",
-        );
+        // client = client.user_agent(
+        //     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:84.0) Gecko/20100101 Firefox/84.0",
+        // );
         let headers = {
             use reqwest::header;
             use reqwest::header::HeaderValue;
@@ -202,7 +213,8 @@ async fn get_product_detail(url: Url) -> Result<Product, Error> {
         client = client.use_native_tls();
         client.build()?
     };
-    let req = client.get(url).build()?;
+    let req = client.get(url.clone()).build()?;
+    let time = chrono::Local::now();
     let res = client.execute(req).await?;
     let document = res.text_with_charset("utf-8").await?;
 
@@ -213,11 +225,7 @@ async fn get_product_detail(url: Url) -> Result<Product, Error> {
         Selector::parse("#priceblock_ourprice").expect("couldn't parse css price id selector");
     let title_selector =
         Selector::parse("#productTitle").expect("couldn't parse css title id selector");
-    let mut product = Product {
-        title: String::new(),
-        price: String::new(),
-    };
-    product.title = document
+    let name = document
         .select(&title_selector)
         .next()
         .expect("there is no title")
@@ -230,20 +238,24 @@ async fn get_product_detail(url: Url) -> Result<Product, Error> {
         .to_string();
     let prod_price = document.select(&price_selector).next();
 
-    match prod_price {
-        Some(price) => {
-            product.price = price.inner_html();
-        }
+    let price = match prod_price {
+        Some(price) => price.inner_html(),
         None => {
             let dealprice_selector =
                 Selector::parse("#priceblock_dealprice").expect("couldn't parse css id selector");
 
             let deal_price = document.select(&dealprice_selector).next();
             match deal_price {
-                Some(price) => product.price = price.inner_html(),
-                None => product.price = "Sold Out".to_string(),
-            };
+                Some(price) => price.inner_html(),
+                None => "Sold Out".to_string(),
+            }
         }
-    }
+    };
+    let mut product = Product {
+        name,
+        price,
+        url,
+        time,
+    };
     Ok(product)
 }
