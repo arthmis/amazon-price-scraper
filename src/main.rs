@@ -19,7 +19,9 @@ use cdrs_tokio::{
     cluster::{ClusterTcpConfig, NodeTcpConfigBuilder, TcpConnectionsManager},
     query::QueryExecutor,
 };
+use log::{debug, error, info};
 use reqwest::ClientBuilder;
+use simplelog::{LevelFilter, WriteLogger};
 
 pub mod db;
 #[derive(Debug, Clone)]
@@ -29,13 +31,21 @@ struct Product {
 }
 #[async_std::main]
 async fn main() -> Result<(), Error> {
-    let mut urls: Vec<Url> = Vec::new();
-    let amazon_urls_file = File::open("amazon_product_urls.txt").expect("file not found");
-    for line in BufReader::new(amazon_urls_file).lines() {
-        let possible_url = Url::parse(&line.expect("line couldn't be read"));
-        match possible_url {
-            Ok(url) => urls.push(url),
-            Err(error) => println!("couldn't parse url: {}\n", error),
+    // initializing logging
+    {
+        let logger_config = {
+            let mut builder = simplelog::ConfigBuilder::new();
+            builder.set_time_to_local(true);
+            builder.set_time_format_str("%r %d-%m-%Y");
+            builder.build()
+        };
+        let log_file = {
+            let mut options = std::fs::OpenOptions::new();
+            options.append(true);
+            options.create(true);
+            options.open("amazon-price-scraper.log")?
+        };
+        let _ = WriteLogger::init(LevelFilter::Info, logger_config, log_file)?;
         }
     }
 
