@@ -1,86 +1,121 @@
 #![allow(warnings)]
 use anyhow::{Context, Error, Result};
-use async_std::{future::timeout, task::JoinHandle};
-use bollard::container::{Config, CreateContainerOptions, StartContainerOptions};
+use async_std::{
+    future::timeout,
+    task::{self, JoinHandle},
+};
 use bollard::service::HostConfig;
+use bollard::{
+    container::{Config, CreateContainerOptions, StartContainerOptions},
+    models::ContainerStateStatusEnum,
+};
 use chrono::Local;
+use db::new_session;
 use prettytable::Table;
 use prettytable::{cell, row};
 use scraper::{Html, Selector};
+use task::sleep;
 use textwrap::fill;
 
-use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::{fs::File, time::Duration};
 
 use url::Url;
 
-use cdrs_tokio::load_balancing::RoundRobin;
-use cdrs_tokio::{authenticators::Authenticator, cluster::session::Session};
+use cdrs_tokio::{
+    authenticators::Authenticator,
+    cluster::session::Session,
+    consistency::Consistency,
+    query::{Query, QueryParams},
+    query_values,
+};
 use cdrs_tokio::{authenticators::NoneAuthenticator, cluster::TcpConnectionPool};
 use cdrs_tokio::{cluster::session, load_balancing::LoadBalancingStrategy};
 use cdrs_tokio::{
     cluster::{ClusterTcpConfig, NodeTcpConfigBuilder, TcpConnectionsManager},
     query::QueryExecutor,
 };
+use cdrs_tokio::{frame::traits::TryFromRow, types::rows::Row};
+use cdrs_tokio::{load_balancing::RoundRobin, query::QueryValues};
 use futures::future::Future;
 use log::{debug, error, info, warn};
 use reqwest::ClientBuilder;
 use simplelog::{LevelFilter, WriteLogger};
 
 pub mod db;
+use db::*;
 #[derive(Debug, Clone)]
 struct Product {
     name: String,
-    price: String,
     url: Url,
     time: chrono::DateTime<Local>,
+    price: String,
 }
+
+impl TryFromRow for Product {
+    fn try_from_row(row: Row) -> Result<Self, cdrs_tokio::Error> {
+        dbg!(&row);
+        Ok(Product {
+            name: String::new(),
+            price: String::new(),
+            url: Url::parse("www.google.com").unwrap(),
+            time: Local::now(),
+        })
+    }
+}
+
+fn init_logging() -> Result<(), Error> {
+    let logger_config = {
+        let mut builder = simplelog::ConfigBuilder::new();
+        builder.set_time_to_local(true);
+        builder.set_time_format_str("%r %d-%m-%Y");
+        builder.add_filter_allow_str("amazon_price_scraper");
+        builder.add_filter_allow_str("amazon_price_scraper::db");
+        builder.build()
+    };
+    let log_file = {
+        let mut options = std::fs::OpenOptions::new();
+        options.append(true);
+        options.create(true);
+        options.open("amazon-price-scraper.log")?
+    };
+    let _ = WriteLogger::init(LevelFilter::Info, logger_config, log_file)?;
+    Ok(())
+}
+
 #[async_std::main]
 async fn main() -> Result<(), Error> {
-    // initializing logging
-    {
-        let logger_config = {
-            let mut builder = simplelog::ConfigBuilder::new();
-            builder.set_time_to_local(true);
-            builder.set_time_format_str("%r %d-%m-%Y");
-            builder.build()
-        };
-        let log_file = {
-            let mut options = std::fs::OpenOptions::new();
-            options.append(true);
-            options.create(true);
-            options.open("amazon-price-scraper.log")?
-        };
-        let _ = WriteLogger::init(LevelFilter::Info, logger_config, log_file)?;
-    }
-    let mut urls: Vec<Url> = Vec::new();
-    let amazon_urls_file = File::open("amazon_product_urls.txt").expect("file not found");
-    for line in BufReader::new(amazon_urls_file).lines() {
-        let possible_url = Url::parse(&line.expect("line couldn't be read"));
-        match possible_url {
-            Ok(url) => urls.push(url),
-            Err(error) => println!("couldn't parse url: {}\n", error),
-        }
-    }
+    init_logging()?;
 
-    let products: Vec<Product> = {
-        // let products = timeout(Duration::from_secs(10), get_product_details(urls)).await??;
-        // let products = get_products(&urls).await?;
-        let products = get_products(&urls[..1]).await?;
-        dbg!(&products);
-        products
-    };
+    // let mut urls: Vec<Url> = Vec::new();
+    // let amazon_urls_file = File::open("amazon_product_urls.txt").expect("file not found");
+    // for line in BufReader::new(amazon_urls_file).lines() {
+    //     let possible_url = Url::parse(&line.expect("line couldn't be read"));
+    //     match possible_url {
+    //         Ok(url) => urls.push(url),
+    //         Err(error) => println!("couldn't parse url: {}\n", error),
+    //     }
+    // }
 
-    dbg!(&products);
+    // let mut products: Vec<Product> = {
+    //     // let products = timeout(Duration::from_secs(10), get_product_details(urls)).await??;
+    //     // let products = get_products(&urls).await?;
+    //     let products = get_products(&urls[..1]).await?;
+    //     dbg!(&products);
+    //     products
+    // };
 
-    let mut my_table = Table::new();
-    my_table.add_row(row!["Name", "Price"]);
+    // dbg!(&products);
 
-    for product in products {
-        my_table.add_row(row![&fill(&product.name, 65), &fill(&product.price, 15)]);
-    }
+    // let mut my_table = Table::new();
+    // my_table.add_row(row!["Name", "Price"]);
 
-    my_table.printstd();
+    // for product in products {
+    //     my_table.add_row(row![&fill(&product.name, 65), &fill(&product.price, 15)]);
+    // }
+
+    // // my_table.printstd();
+    // info!("Table Data:\n{}", my_table.to_string());
 
     // TODO: if docker fails to connect then this should send a desktop notification
     // which should prompt me to start docker and allow the program to run correctly
@@ -89,18 +124,26 @@ async fn main() -> Result<(), Error> {
     let container_name = "scylla";
     match docker.inspect_container(container_name, None).await {
         // if found then start container
-        Ok(_res) => {
+        Ok(res) => {
             // TODO: Container might already be running so handle error
             // in that case
-            docker
-                .start_container(
-                    container_name,
-                    Some(StartContainerOptions {
-                        detach_keys: "ctrl-^",
-                    }),
-                )
-                .await?;
-            info!("Starting {} container.", container_name);
+            let state = res.state.unwrap();
+            match state.status.unwrap() {
+                ContainerStateStatusEnum::RUNNING => {}
+                ContainerStateStatusEnum::PAUSED | ContainerStateStatusEnum::EXITED => {
+                    docker
+                        .start_container(
+                            container_name,
+                            Some(StartContainerOptions {
+                                detach_keys: "ctrl-^",
+                            }),
+                        )
+                        .await?;
+                    info!("Starting {} container.", container_name);
+                    sleep(Duration::from_secs(30)).await;
+                }
+                _ => return panic!("State should be running or paused"),
+            }
         }
         // if err then create a container and start it
         Err(err) => {
@@ -139,24 +182,38 @@ async fn main() -> Result<(), Error> {
                 )
                 .await?;
             info!("Starting {} container.", container_name);
+            sleep(Duration::from_secs(30)).await;
         }
     };
     // Here goes code to move product data into the database then program should stop container
     // and close docker down if that is possible
-    let create_ks = "CREATE KEYSPACE IF NOT EXISTS amazon WITH REPLICATION = { \
-                             'class' : 'SimpleStrategy', 'replication_factor' : 1 };";
 
-    let result: Result<(), anyhow::Error> = {
-        let node = NodeTcpConfigBuilder::new("127.0.0.1:9042", NoneAuthenticator {}).build();
-        let cluster_config = ClusterTcpConfig(vec![node]);
-        let session = session::new(&cluster_config, RoundRobin::new()).await?;
-        session
-            .query(create_ks)
-            .await
-            .expect("Keyspace create error");
-        Ok(())
+    // initialize scylla db
+    let session = new_session("127.0.0.1:9042").await?;
+    session.query(CREATE_KEYSPACE).await?;
+    info!("Created Keyspace amazon.");
+
+    session.query(CREATE_PRODUCT_TABLE).await?;
+    info!("Created table to store product data.");
+
+    // let product = products.pop().unwrap();
+    let product = Product {
+        name: String::from("Nikon z6"),
+        url: Url::parse("https://google.com").unwrap(),
+        time: Local::now(),
+        price: String::from("$2000.00"),
     };
-    result.unwrap();
+
+    let query_values = query_values!(
+        "name" => product.name,
+        "url" => product.url.to_string(),
+        // "time" => product.time.format("%Y-%m-%d %H:%M:%S").to_string(),
+        "time" => product.time.timestamp(),
+        "price" => product.price
+    );
+    session
+        .query_with_values(ADD_PRODUCT_PRICE, query_values)
+        .await?;
 
     Ok(())
 }

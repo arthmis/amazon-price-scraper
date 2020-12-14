@@ -11,13 +11,16 @@ pub const CREATE_KEYSPACE: &str = "CREATE KEYSPACE IF NOT EXISTS amazon
             'replication_factor' : 1 
     };";
 
-pub const CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS amazon.prices ( 
-    url text, 
+pub const CREATE_PRODUCT_TABLE: &str = "CREATE TABLE IF NOT EXISTS amazon.prices ( 
     name text,
+    url text, 
     time timestamp, 
     price decimal, 
-    PRIMARY KEY(url, time) 
+    PRIMARY KEY(name, time) 
 );";
+
+pub const ADD_PRODUCT_PRICE: &str =
+    "INSERT INTO amazon.prices (name, url, time, price) VALUES (?, ?, ?, ?)";
 
 pub async fn new_session(
     addr: &str,
