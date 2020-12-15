@@ -1,16 +1,12 @@
-#![allow(warnings)]
+// #![allow(warnings)]
 use anyhow::{Context, Error, Result};
-use async_std::{
-    future::timeout,
-    task::{self, JoinHandle},
-};
+use async_std::{future::timeout, task};
 use bollard::service::HostConfig;
 use bollard::{
     container::{Config, CreateContainerOptions, StartContainerOptions},
     models::ContainerStateStatusEnum,
 };
-use chrono::Local;
-use db::new_session;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use prettytable::Table;
 use prettytable::{cell, row};
 use scraper::{Html, Selector};
@@ -22,45 +18,68 @@ use std::{fs::File, time::Duration};
 
 use url::Url;
 
-use cdrs_tokio::{
-    authenticators::Authenticator,
-    cluster::session::Session,
-    consistency::Consistency,
-    query::{Query, QueryParams},
-    query_values,
-};
-use cdrs_tokio::{authenticators::NoneAuthenticator, cluster::TcpConnectionPool};
-use cdrs_tokio::{cluster::session, load_balancing::LoadBalancingStrategy};
-use cdrs_tokio::{
-    cluster::{ClusterTcpConfig, NodeTcpConfigBuilder, TcpConnectionsManager},
-    query::QueryExecutor,
-};
-use cdrs_tokio::{frame::traits::TryFromRow, types::rows::Row};
-use cdrs_tokio::{load_balancing::RoundRobin, query::QueryValues};
-use futures::future::Future;
+use cdrs_tokio::query::QueryExecutor;
+use cdrs_tokio::types::rows::Row;
+use cdrs_tokio::types::IntoRustByName;
 use log::{debug, error, info, warn};
-use reqwest::ClientBuilder;
 use simplelog::{LevelFilter, WriteLogger};
 
 pub mod db;
-use db::*;
+
+use db::{get_products, new_session};
 #[derive(Debug, Clone)]
-struct Product {
+pub struct Product {
     name: String,
     url: Url,
-    time: chrono::DateTime<Local>,
-    price: String,
+    time: chrono::DateTime<Utc>,
+    price: ProductPrice,
 }
 
-impl TryFromRow for Product {
-    fn try_from_row(row: Row) -> Result<Self, cdrs_tokio::Error> {
-        dbg!(&row);
-        Ok(Product {
-            name: String::new(),
-            price: String::new(),
-            url: Url::parse("www.google.com").unwrap(),
-            time: Local::now(),
-        })
+impl From<Row> for Product {
+    fn from(row: Row) -> Self {
+        let name: String = row.get_by_name("name").unwrap().unwrap();
+        let price = {
+            let price: String = row.get_by_name("price").unwrap().unwrap();
+            match price.as_str() {
+                "Sold Out" => ProductPrice::SoldOut,
+                _ => ProductPrice::Price(price),
+            }
+        };
+        let time = {
+            let time: i64 = row.get_by_name("time").unwrap().unwrap();
+            let new_time = NaiveDateTime::from_timestamp(time, 0);
+            DateTime::<Utc>::from_utc(new_time, Utc)
+        };
+        let url = {
+            let raw_url: String = row.get_by_name("url").unwrap().unwrap();
+            Url::parse(&raw_url).unwrap()
+        };
+        Product {
+            name,
+            url,
+            time,
+            price,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ProductPrice {
+    Price(String),
+    SoldOut,
+}
+
+use std::string::ToString;
+impl ToString for ProductPrice {
+    fn to_string(&self) -> String {
+        match self {
+            Self::Price(price) => {
+                dbg!(&price);
+                let price = price.trim();
+                price.replace('$', "")
+            }
+            Self::SoldOut => "Sold Out".to_string(),
+        }
     }
 }
 
@@ -87,35 +106,30 @@ fn init_logging() -> Result<(), Error> {
 async fn main() -> Result<(), Error> {
     init_logging()?;
 
-    // let mut urls: Vec<Url> = Vec::new();
-    // let amazon_urls_file = File::open("amazon_product_urls.txt").expect("file not found");
-    // for line in BufReader::new(amazon_urls_file).lines() {
-    //     let possible_url = Url::parse(&line.expect("line couldn't be read"));
-    //     match possible_url {
-    //         Ok(url) => urls.push(url),
-    //         Err(error) => println!("couldn't parse url: {}\n", error),
-    //     }
-    // }
+    let mut urls: Vec<Url> = Vec::new();
+    let amazon_urls_file = File::open("amazon_product_urls.txt").expect("file not found");
+    for line in BufReader::new(amazon_urls_file).lines() {
+        let possible_url = Url::parse(&line.expect("line couldn't be read"));
+        urls.push(possible_url?);
+    }
 
-    // let mut products: Vec<Product> = {
-    //     // let products = timeout(Duration::from_secs(10), get_product_details(urls)).await??;
-    //     // let products = get_products(&urls).await?;
-    //     let products = get_products(&urls[..1]).await?;
-    //     dbg!(&products);
-    //     products
-    // };
+    let products: Vec<Product> = {
+        let products = scrape_products(&urls[..3]).await?;
+        products
+    };
 
-    // dbg!(&products);
+    let mut my_table = Table::new();
+    my_table.add_row(row!["Name", "Price"]);
 
-    // let mut my_table = Table::new();
-    // my_table.add_row(row!["Name", "Price"]);
+    for product in products.iter() {
+        my_table.add_row(row![
+            &fill(&product.name, 65),
+            &fill(&product.price.to_string(), 15)
+        ]);
+    }
 
-    // for product in products {
-    //     my_table.add_row(row![&fill(&product.name, 65), &fill(&product.price, 15)]);
-    // }
-
-    // // my_table.printstd();
-    // info!("Table Data:\n{}", my_table.to_string());
+    // my_table.printstd();
+    info!("Table Data:\n{}", my_table.to_string());
 
     // TODO: if docker fails to connect then this should send a desktop notification
     // which should prompt me to start docker and allow the program to run correctly
@@ -129,7 +143,12 @@ async fn main() -> Result<(), Error> {
             // in that case
             let state = res.state.unwrap();
             match state.status.unwrap() {
-                ContainerStateStatusEnum::RUNNING => {}
+                ContainerStateStatusEnum::RUNNING => {
+                    debug!(
+                        "Container is already running. Container state is: {}",
+                        state.status.unwrap()
+                    );
+                }
                 ContainerStateStatusEnum::PAUSED | ContainerStateStatusEnum::EXITED => {
                     docker
                         .start_container(
@@ -140,9 +159,17 @@ async fn main() -> Result<(), Error> {
                         )
                         .await?;
                     info!("Starting {} container.", container_name);
+                    // wait for container and scylla to start
                     sleep(Duration::from_secs(30)).await;
                 }
-                _ => return panic!("State should be running or paused"),
+                // I think this should be unreachable
+                _ => {
+                    error!(
+                        "reached an unreachable state: Container State -> {:?}",
+                        state
+                    );
+                    unreachable!("State should be running or paused");
+                }
             }
         }
         // if err then create a container and start it
@@ -168,9 +195,9 @@ async fn main() -> Result<(), Error> {
                     }),
                     create_container_config,
                 )
-                .await
-                .unwrap();
+                .await?;
 
+            debug!("Container create response: {:?}\n", res);
             info!("Creating {} container.", container_name);
 
             docker
@@ -190,50 +217,23 @@ async fn main() -> Result<(), Error> {
 
     // initialize scylla db
     let session = new_session("127.0.0.1:9042").await?;
-    session.query(CREATE_KEYSPACE).await?;
-    info!("Created Keyspace amazon.");
+    session.query(db::CREATE_KEYSPACE).await?;
 
-    session.query(CREATE_PRODUCT_TABLE).await?;
-    info!("Created table to store product data.");
+    session.query(db::CREATE_PRODUCT_TABLE).await?;
 
-    // let product = products.pop().unwrap();
-    let product = Product {
-        name: String::from("Nikon z6"),
-        url: Url::parse("https://google.com").unwrap(),
-        time: Local::now(),
-        price: String::from("$2000.00"),
-    };
-
-    let query_values = query_values!(
-        "name" => product.name,
-        "url" => product.url.to_string(),
-        // "time" => product.time.format("%Y-%m-%d %H:%M:%S").to_string(),
-        "time" => product.time.timestamp(),
-        "price" => product.price
-    );
-    session
-        .query_with_values(ADD_PRODUCT_PRICE, query_values)
-        .await?;
+    for product in products.iter() {
+        db::insert_product(product, &session).await?;
+    }
+    // dbg!(db::get_all_products(&session).await?);
 
     Ok(())
 }
 
-async fn get_products(urls: &[Url]) -> Result<Vec<Product>, Error> {
+async fn scrape_products(urls: &[Url]) -> Result<Vec<Product>, Error> {
     let mut products: Vec<Product> = Vec::new();
 
-    for url in urls.iter() {
-        let product = async_std::task::spawn(get_product_detail(url.clone())).await?;
-        products.push(product);
-    }
-    Ok(products)
-}
-
-async fn get_product_detail(url: Url) -> Result<Product, Error> {
     let client = {
         let mut client = reqwest::ClientBuilder::new();
-        // client = client.user_agent(
-        //     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:84.0) Gecko/20100101 Firefox/84.0",
-        // );
         let headers = {
             use reqwest::header;
             use reqwest::header::HeaderValue;
@@ -270,8 +270,20 @@ async fn get_product_detail(url: Url) -> Result<Product, Error> {
         client = client.use_native_tls();
         client.build()?
     };
+    for url in urls.iter() {
+        let product = timeout(
+            Duration::from_secs(5),
+            async_std::task::spawn(scrape_product_detail(url.clone(), client.clone())),
+        )
+        .await?;
+        products.push(product?);
+    }
+    Ok(products)
+}
+
+async fn scrape_product_detail(url: Url, client: reqwest::Client) -> Result<Product, Error> {
     let req = client.get(url.clone()).build()?;
-    let time = chrono::Local::now();
+    let time = Utc::now();
     let res = client.execute(req).await?;
     let document = res.text_with_charset("utf-8").await?;
 
@@ -296,19 +308,19 @@ async fn get_product_detail(url: Url) -> Result<Product, Error> {
     let prod_price = document.select(&price_selector).next();
 
     let price = match prod_price {
-        Some(price) => price.inner_html(),
+        Some(price) => ProductPrice::Price(price.inner_html()),
         None => {
             let dealprice_selector =
                 Selector::parse("#priceblock_dealprice").expect("couldn't parse css id selector");
 
             let deal_price = document.select(&dealprice_selector).next();
             match deal_price {
-                Some(price) => price.inner_html(),
-                None => "Sold Out".to_string(),
+                Some(price) => ProductPrice::Price(price.inner_html()),
+                None => ProductPrice::SoldOut,
             }
         }
     };
-    let mut product = Product {
+    let product = Product {
         name,
         price,
         url,
