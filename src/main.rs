@@ -1,16 +1,15 @@
 // #![allow(warnings)]
 use anyhow::{Context, Error, Result};
-use async_std::{future::timeout, task};
-use bollard::service::HostConfig;
+use async_std::{future::timeout, task, task::sleep};
 use bollard::{
     container::{Config, CreateContainerOptions, StartContainerOptions},
     models::ContainerStateStatusEnum,
 };
+use bollard::{service::HostConfig, Docker};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use prettytable::Table;
 use prettytable::{cell, row};
 use scraper::{Html, Selector};
-use task::sleep;
 use textwrap::fill;
 
 use std::io::{BufRead, BufReader};
@@ -128,14 +127,37 @@ async fn main() -> Result<(), Error> {
         ]);
     }
 
-    // my_table.printstd();
-    info!("Table Data:\n{}", my_table.to_string());
+    // // my_table.printstd();
+    // info!("Table Data:\n{}", my_table.to_string());
 
     // TODO: if docker fails to connect then this should send a desktop notification
     // which should prompt me to start docker and allow the program to run correctly
-    let docker = bollard::Docker::connect_with_local_defaults()?;
+    let docker = Docker::connect_with_local_defaults()?;
 
     let container_name = "scylla";
+    start_docker_container(&docker, container_name).await?;
+
+    // Here goes code to move product data into the database then program should stop container
+    // and close docker down if that is possible
+
+    // initialize scylla db
+    let session = new_session("127.0.0.1:9042").await?;
+    session.query(db::CREATE_KEYSPACE).await?;
+
+    session.query(db::CREATE_PRODUCT_TABLE).await?;
+
+    for product in products.iter() {
+        db::insert_product(product, &session).await?;
+    }
+    // dbg!(db::get_all_products(&session).await?);
+
+    Ok(())
+}
+
+async fn start_docker_container(
+    docker: &Docker,
+    container_name: &str,
+) -> Result<(), bollard::errors::Error> {
     match docker.inspect_container(container_name, None).await {
         // if found then start container
         Ok(res) => {
@@ -176,7 +198,7 @@ async fn main() -> Result<(), Error> {
         Err(err) => {
             // log error first
             warn!("Potential issue finding container {}.", container_name);
-            error!("{}", err);
+            error!("Docker is possibly not currently running. Be sure to start docker before running this program: {}", err);
 
             let host_config = HostConfig {
                 memory: Some(2_000_000_000),
@@ -212,20 +234,6 @@ async fn main() -> Result<(), Error> {
             sleep(Duration::from_secs(30)).await;
         }
     };
-    // Here goes code to move product data into the database then program should stop container
-    // and close docker down if that is possible
-
-    // initialize scylla db
-    let session = new_session("127.0.0.1:9042").await?;
-    session.query(db::CREATE_KEYSPACE).await?;
-
-    session.query(db::CREATE_PRODUCT_TABLE).await?;
-
-    for product in products.iter() {
-        db::insert_product(product, &session).await?;
-    }
-    // dbg!(db::get_all_products(&session).await?);
-
     Ok(())
 }
 
@@ -273,7 +281,7 @@ async fn scrape_products(urls: &[Url]) -> Result<Vec<Product>, Error> {
     for url in urls.iter() {
         let product = timeout(
             Duration::from_secs(5),
-            async_std::task::spawn(scrape_product_detail(url.clone(), client.clone())),
+            task::spawn(scrape_product_detail(url.clone(), client.clone())),
         )
         .await?;
         products.push(product?);

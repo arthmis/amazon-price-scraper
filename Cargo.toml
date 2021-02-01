@@ -10,15 +10,14 @@ prettytable-rs = "0.8.0"
 textwrap = "0.12.1"
 url = "2.2.0"
 anyhow = "1"
-async-std = {version = "1", features = ["attributes", "tokio03", "tokio02"]}
+async-std = {version = "1", features = ["attributes", "tokio02", "tokio1"]}
 futures = "0.3.8"
-cdrs-tokio = "1"
+cdrs-tokio = "2"
 chrono = "0.4"
-reqwest = { version = "0.10.9", features = ["brotli", "gzip", "native-tls", "cookies"] }
+reqwest = { version = "0.11", features = ["brotli", "gzip", "native-tls", "cookies"] }
 bollard = "0.9.0"
-simplelog = "0.8.0"
+simplelog = "0.9.0"
 log = "0.4.11"
-# rust_decimal = "1"
 
 [profile.dev]
 opt-level = 1
