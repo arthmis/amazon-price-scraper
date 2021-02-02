@@ -1,19 +1,18 @@
 // #![allow(warnings)]
 use anyhow::{Context, Error, Result};
-use async_std::{future::timeout, task, task::sleep};
+use async_std::task::{self, sleep};
 use bollard::{
     container::{Config, CreateContainerOptions, StartContainerOptions},
     models::ContainerStateStatusEnum,
 };
 use bollard::{service::HostConfig, Docker};
 use chrono::{DateTime, NaiveDateTime, Utc};
-use prettytable::Table;
-use prettytable::{cell, row};
-use scraper::{Html, Selector};
-use textwrap::fill;
 
-use std::io::{BufRead, BufReader};
-use std::{fs::File, time::Duration};
+use clap::{App, Arg};
+use rusqlite::{Connection, Rows, NO_PARAMS};
+use scrape::{get_product_name, scrape_amazon};
+
+use std::time::Duration;
 
 use url::Url;
 
@@ -24,6 +23,7 @@ use log::{debug, error, info, warn};
 use simplelog::{LevelFilter, WriteLogger};
 
 pub mod db;
+mod scrape;
 
 use db::{get_products, new_session};
 #[derive(Debug, Clone)]
@@ -101,55 +101,99 @@ fn init_logging() -> Result<(), Error> {
     Ok(())
 }
 
-#[async_std::main]
-async fn main() -> Result<(), Error> {
+fn main() -> Result<(), Error> {
     init_logging()?;
 
-    let mut urls: Vec<Url> = Vec::new();
-    let amazon_urls_file = File::open("amazon_product_urls.txt").expect("file not found");
-    for line in BufReader::new(amazon_urls_file).lines() {
-        let possible_url = Url::parse(&line.expect("line couldn't be read"));
-        urls.push(possible_url?);
-    }
+    let app = App::new("Amazon Price Bot")
+        .version("0.5")
+        .author("Arthmis <arthmis20@gmail.com>")
+        .arg(
+            Arg::with_name("scrape")
+                .long("scrape")
+                .help("Immediately starts scraping Amazon, out of schedule.")
+                .takes_value(false),
+        )
+        .arg(Arg::with_name("product").short("a").long("add").help(
+            "Adds a product that will be scraped in future crawls. Takes a valid URL as input.",
+        ).takes_value(true))
+        .arg(
+            Arg::with_name("remove")
+                .short("r")
+                .long("remove")
+                .help("Removes a product from future price scraping"),
+        )
+        .arg(
+            Arg::with_name("list")
+            .short("-l")
+            .long("list")
+            .takes_value(false)
+            .help("Lists all products that are currently scraped.")
+        );
 
-    let products: Vec<Product> = {
-        let products = scrape_products(&urls[..3]).await?;
-        products
-    };
+    let matches = app.get_matches();
+    if matches.is_present("scrape") {
+        let _: Result<_, Error> = task::block_on(async {
+            let products = scrape_amazon();
 
-    let mut my_table = Table::new();
-    my_table.add_row(row!["Name", "Price"]);
+            // TODO: if docker fails to connect then this should send a desktop notification
+            // which should prompt me to start docker and allow the program to run correctly
+            let docker = Docker::connect_with_local_defaults()?;
 
-    for product in products.iter() {
-        my_table.add_row(row![
-            &fill(&product.name, 65),
-            &fill(&product.price.to_string(), 15)
-        ]);
-    }
+            let container_name = "scylla";
+            start_docker_container(&docker, container_name).await?;
 
+            // Here goes code to move product data into the database then program should stop container
+            // and close docker down if that is possible
+
+            // initialize scylla db
+            let session = new_session("127.0.0.1:9042").await?;
+            session.query(db::CREATE_KEYSPACE).await?;
+            session.query(db::CREATE_PRODUCT_TABLE).await?;
+
+            let products = products.await?;
+            for product in products.iter() {
+                db::insert_product(product, &session).await?;
+            }
+            Ok(())
+        });
     // // my_table.printstd();
     // info!("Table Data:\n{}", my_table.to_string());
 
-    // TODO: if docker fails to connect then this should send a desktop notification
-    // which should prompt me to start docker and allow the program to run correctly
-    let docker = Docker::connect_with_local_defaults()?;
-
-    let container_name = "scylla";
-    start_docker_container(&docker, container_name).await?;
-
-    // Here goes code to move product data into the database then program should stop container
-    // and close docker down if that is possible
-
-    // initialize scylla db
-    let session = new_session("127.0.0.1:9042").await?;
-    session.query(db::CREATE_KEYSPACE).await?;
-
-    session.query(db::CREATE_PRODUCT_TABLE).await?;
-
-    for product in products.iter() {
-        db::insert_product(product, &session).await?;
-    }
     // dbg!(db::get_all_products(&session).await?);
+    } else if matches.is_present("product") {
+        let url = matches.value_of_os("product").unwrap();
+        let url = url.to_string_lossy().to_string();
+        let url = Url::parse(&url)
+            .with_context(|| format!("The provided url was not valid. Input url was: {}", url))?;
+        // takes url and scrapes its web page to get its name
+        let _: Result<(), Error> = task::block_on(async {
+            let name = get_product_name(&url).await?;
+            let conn = Connection::open("products.db")?;
+
+            conn.execute(
+                "
+            CREATE TABLE IF NOT EXISTS Products (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL
+            )",
+                NO_PARAMS,
+            )?;
+
+            conn.execute("INSERT INTO Products (name) values (?1)", &[&name])?;
+            Ok(())
+        });
+    // looks in sqlite database and retrieves all product names
+    // prints them out
+    } else if matches.is_present("list") {
+        let conn = Connection::open("products.db")?;
+
+        let mut stmt = conn.prepare("SELECT name FROM products")?;
+        let rows = stmt.query_map(NO_PARAMS, |row| row.get("name"))?;
+        for name in rows {
+            let name: String = name?;
+            println!("{}", name);
+        }
+    }
 
     Ok(())
 }
@@ -235,104 +279,4 @@ async fn start_docker_container(
         }
     };
     Ok(())
-}
-
-async fn scrape_products(urls: &[Url]) -> Result<Vec<Product>, Error> {
-    let mut products: Vec<Product> = Vec::new();
-
-    let client = {
-        let mut client = reqwest::ClientBuilder::new();
-        let headers = {
-            use reqwest::header;
-            use reqwest::header::HeaderValue;
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(
-                header::ACCEPT,
-                HeaderValue::from_str(
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                )?,
-            );
-            headers.insert(
-                header::ACCEPT_ENCODING,
-                HeaderValue::from_str("gzip, deflate, br")?,
-            );
-            headers.insert(
-                header::ACCEPT_LANGUAGE,
-                HeaderValue::from_str("en-US,en;q=0.5")?,
-            );
-            headers.insert(header::CACHE_CONTROL, HeaderValue::from_str("no-cache")?);
-            headers.insert(header::CONNECTION, HeaderValue::from_str("keep-alive")?);
-            headers.insert(header::DNT, HeaderValue::from_str("1")?);
-            headers.insert(header::HOST, HeaderValue::from_str("www.amazon.com")?);
-            headers.insert(header::PRAGMA, HeaderValue::from_str("no-cache")?);
-            headers.insert(
-                header::UPGRADE_INSECURE_REQUESTS,
-                HeaderValue::from_str("1")?,
-            );
-            headers
-        };
-        client = client.gzip(true);
-        client = client.brotli(true);
-        client = client.cookie_store(true);
-        client = client.default_headers(headers);
-        client = client.use_native_tls();
-        client.build()?
-    };
-    for url in urls.iter() {
-        let product = timeout(
-            Duration::from_secs(5),
-            task::spawn(scrape_product_detail(url.clone(), client.clone())),
-        )
-        .await?;
-        products.push(product?);
-    }
-    Ok(products)
-}
-
-async fn scrape_product_detail(url: Url, client: reqwest::Client) -> Result<Product, Error> {
-    let req = client.get(url.clone()).build()?;
-    let time = Utc::now();
-    let res = client.execute(req).await?;
-    let document = res.text_with_charset("utf-8").await?;
-
-    let document = document;
-    let document = Html::parse_document(&document);
-
-    let price_selector =
-        Selector::parse("#priceblock_ourprice").expect("couldn't parse css price id selector");
-    let title_selector =
-        Selector::parse("#productTitle").expect("couldn't parse css title id selector");
-    let name = document
-        .select(&title_selector)
-        .next()
-        .expect("there is no title")
-        .inner_html()
-        .trim()
-        .to_string()
-        .split(',')
-        .next()
-        .unwrap()
-        .to_string();
-    let prod_price = document.select(&price_selector).next();
-
-    let price = match prod_price {
-        Some(price) => ProductPrice::Price(price.inner_html()),
-        None => {
-            let dealprice_selector =
-                Selector::parse("#priceblock_dealprice").expect("couldn't parse css id selector");
-
-            let deal_price = document.select(&dealprice_selector).next();
-            match deal_price {
-                Some(price) => ProductPrice::Price(price.inner_html()),
-                None => ProductPrice::SoldOut,
-            }
-        }
-    };
-    let product = Product {
-        name,
-        price,
-        url,
-        time,
-    };
-    Ok(product)
 }

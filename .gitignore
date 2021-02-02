@@ -1,1 +1,6 @@
 target
+.gitignore
+amazon_product_urls.txt
+amazon-price-scraper.log
+products.db
+.vscode
