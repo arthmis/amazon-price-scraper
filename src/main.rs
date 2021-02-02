@@ -9,8 +9,10 @@ use bollard::{service::HostConfig, Docker};
 use chrono::{DateTime, NaiveDateTime, Utc};
 
 use clap::{App, Arg};
-use rusqlite::{Connection, Rows, NO_PARAMS};
+use prettytable::{cell, row, Table};
+use rusqlite::{Connection, NO_PARAMS};
 use scrape::{get_product_name, scrape_amazon};
+use textwrap::fill;
 
 use std::time::Duration;
 
@@ -25,7 +27,7 @@ use simplelog::{LevelFilter, WriteLogger};
 pub mod db;
 mod scrape;
 
-use db::{get_products, new_session};
+use db::{new_session, ScyllaSession};
 #[derive(Debug, Clone)]
 pub struct Product {
     name: String,
@@ -33,6 +35,13 @@ pub struct Product {
     time: chrono::DateTime<Utc>,
     price: ProductPrice,
 }
+#[derive(Debug, Clone)]
+pub struct ProductInfo {
+    price: ProductPrice,
+    time: chrono::DateTime<Utc>,
+}
+
+const ADDR: &str = "127.0.0.1:9042";
 
 impl From<Row> for Product {
     fn from(row: Row) -> Self {
@@ -62,6 +71,23 @@ impl From<Row> for Product {
     }
 }
 
+impl From<Row> for ProductInfo {
+    fn from(row: Row) -> Self {
+        let price = {
+            let price: String = row.get_by_name("price").unwrap().unwrap();
+            match price.as_str() {
+                "Sold Out" => ProductPrice::SoldOut,
+                _ => ProductPrice::Price(price),
+            }
+        };
+        let time = {
+            let time: i64 = row.get_by_name("time").unwrap().unwrap();
+            let new_time = NaiveDateTime::from_timestamp(time, 0);
+            DateTime::<Utc>::from_utc(new_time, Utc)
+        };
+        ProductInfo { time, price }
+    }
+}
 #[derive(Debug, Clone)]
 enum ProductPrice {
     Price(String),
@@ -128,12 +154,38 @@ fn main() -> Result<(), Error> {
             .long("list")
             .takes_value(false)
             .help("Lists all products that are currently scraped.")
+        )
+        .arg(
+            Arg::with_name("plot")
+            .short("-p")
+            .long("plot")
+            .takes_value(true)
+            .help("Plots the price over time for a product.")
         );
 
     let matches = app.get_matches();
     if matches.is_present("scrape") {
         let _: Result<_, Error> = task::block_on(async {
-            let products = scrape_amazon();
+            let conn = Connection::open("products.db")?;
+
+            let mut stmt = conn.prepare("SELECT name, url FROM products")?;
+            let mut products = Vec::new();
+            let rows = stmt.query_map(NO_PARAMS, |row| Ok((row.get("name")?, row.get("url")?)))?;
+            for info in rows {
+                let (name, url): (String, String) = info?;
+                products.push((name, Url::parse(&url)?));
+            }
+            dbg!(&products);
+            // TODO: think about creating an iterator instead of creating a vector
+            let urls = {
+                let mut urls = Vec::new();
+                for (_, url) in products.iter() {
+                    urls.push(url.clone());
+                }
+                urls
+            };
+
+            let new_products_info = scrape_amazon(&urls);
 
             // TODO: if docker fails to connect then this should send a desktop notification
             // which should prompt me to start docker and allow the program to run correctly
@@ -146,14 +198,24 @@ fn main() -> Result<(), Error> {
             // and close docker down if that is possible
 
             // initialize scylla db
-            let session = new_session("127.0.0.1:9042").await?;
+            let session = new_session(ADDR).await?;
             session.query(db::CREATE_KEYSPACE).await?;
             session.query(db::CREATE_PRODUCT_TABLE).await?;
 
-            let products = products.await?;
-            for product in products.iter() {
-                db::insert_product(product, &session).await?;
+            let new_products_info = new_products_info.await?;
+            for ((name, url), new_info) in products.iter().zip(new_products_info.iter()) {
+                db::insert_new_product_info(&session, name, url, new_info).await?;
             }
+            let mut product_table = Table::new();
+            product_table.add_row(row!["Name", "Price"]);
+
+            for ((name, _), product_info) in products.iter().zip(new_products_info.iter()) {
+                product_table.add_row(row![
+                    &fill(name, 65),
+                    &fill(&product_info.price.to_string(), 15)
+                ]);
+            }
+            product_table.printstd();
             Ok(())
         });
     // // my_table.printstd();
@@ -163,6 +225,7 @@ fn main() -> Result<(), Error> {
     } else if matches.is_present("product") {
         let url = matches.value_of_os("product").unwrap();
         let url = url.to_string_lossy().to_string();
+        let db_url = url.clone();
         let url = Url::parse(&url)
             .with_context(|| format!("The provided url was not valid. Input url was: {}", url))?;
         // takes url and scrapes its web page to get its name
@@ -174,12 +237,16 @@ fn main() -> Result<(), Error> {
                 "
             CREATE TABLE IF NOT EXISTS Products (
                 id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL
+                name TEXT NOT NULL,
+                url TEXT NOT NULL
             )",
                 NO_PARAMS,
             )?;
 
-            conn.execute("INSERT INTO Products (name) values (?1)", &[&name])?;
+            conn.execute(
+                "INSERT INTO Products (name, url) values (?1, ?2)",
+                &[&name, &db_url],
+            )?;
             Ok(())
         });
     // looks in sqlite database and retrieves all product names
@@ -193,6 +260,17 @@ fn main() -> Result<(), Error> {
             let name: String = name?;
             println!("{}", name);
         }
+    } else if matches.is_present("plot") {
+        let name = matches.value_of("plot").unwrap().to_owned();
+        let product_data: Result<Vec<(String, DateTime<Utc>)>, Error> = task::block_on(async {
+            let session: ScyllaSession = new_session(ADDR).await?;
+            let product_info = db::get_product_prices(&name, &session).await?.unwrap();
+            // dbg!(product_info);
+
+            Ok(product_info)
+        });
+        dbg!(product_data?);
+        // search in scylla and get all prices on this product
     }
 
     Ok(())
@@ -239,6 +317,7 @@ async fn start_docker_container(
             }
         }
         // if err then create a container and start it
+        // handle errors beter
         Err(err) => {
             // log error first
             warn!("Potential issue finding container {}.", container_name);
