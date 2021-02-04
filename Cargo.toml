@@ -21,6 +21,7 @@ log = "0.4.14"
 clap = "2"
 rusqlite = { version = "0.24", features=["bundled"] }
 plotters = "0.3.0"
+rust_decimal = "1"
 
 [profile.dev]
 opt-level = 1

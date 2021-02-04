@@ -49,6 +49,7 @@ dependencies = [
  "prettytable-rs",
  "reqwest",
  "rusqlite",
+ "rust_decimal",
  "scraper",
  "simplelog",
  "textwrap 0.12.1",
@@ -2467,6 +2468,17 @@ dependencies = [
  "blake2b_simd",
  "constant_time_eq",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "rust_decimal"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d1fde955d206c00af1eb529d8ebfca3b505921820a0436566dbcc6c4d4ffb3"
+dependencies = [
+ "arrayvec",
+ "num-traits",
+ "serde",
 ]
 
 [[package]]

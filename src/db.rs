@@ -1,7 +1,9 @@
+use anyhow::Error;
 use cdrs_tokio::{
     authenticators::NoneAuthenticator,
     cluster::{ClusterTcpConfig, NodeTcpConfigBuilder, TcpConnectionPool},
     frame::frame_response::ResponseBody,
+    query::{self, QueryParamsBuilder, QueryValues},
 };
 use cdrs_tokio::{cluster::session, cluster::session::Session};
 use cdrs_tokio::{load_balancing::SingleNode, query_values};
@@ -39,17 +41,27 @@ pub async fn new_session(addr: &str) -> Result<ScyllaSession, anyhow::Error> {
 pub async fn insert_product(
     product: &Product,
     session: &Session<SingleNode<TcpConnectionPool<NoneAuthenticator>>>,
-) -> Result<(), anyhow::Error> {
+) -> Result<(), Error> {
     let query_values = query_values!(
         "name" => product.name.clone(),
         "url" => product.url.to_string(),
-        // "time" => product.time.format("%Y-%m-%d %H:%M:%S").to_string(),
         "time" => product.time.timestamp(),
         "price" => product.price.to_string()
     );
     session
         .query_with_values(INSERT_PRODUCT, query_values)
         .await?;
+    Ok(())
+}
+
+pub async fn delete_product(name: &str, session: &ScyllaSession) -> Result<(), Error> {
+    // let delete = r#"DELETE name, time FROM amazon.prices WHERE name = ?"#;
+    let delete = r#"DELETE FROM amazon.prices WHERE name = ?"#;
+    let query_values = query_values!(
+        "name" => name
+    );
+    // let params = QueryParamsBuilder::new().values();
+    session.query_with_values(delete, query_values).await?;
     Ok(())
 }
 

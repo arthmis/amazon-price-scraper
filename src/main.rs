@@ -1,5 +1,5 @@
 // #![allow(warnings)]
-use anyhow::{Context, Error, Result};
+use anyhow::{bail, Context, Error, Result};
 use async_std::task::{self, sleep};
 use bollard::{
     container::{Config, CreateContainerOptions, StartContainerOptions},
@@ -9,9 +9,13 @@ use bollard::{service::HostConfig, Docker};
 use chrono::{DateTime, NaiveDateTime, Utc};
 
 use clap::{App, Arg};
+use plotters::prelude::{ChartBuilder, IntoDrawingArea, LabelAreaPosition, LineSeries, SVGBackend};
+use plotters::style::{self, AsRelative, Color, Palette};
 use prettytable::{cell, row, Table};
 use rusqlite::{Connection, NO_PARAMS};
+use rust_decimal::{prelude::ToPrimitive, Decimal};
 use scrape::{get_product_name, scrape_amazon};
+use style::{Palette99, TextStyle};
 use textwrap::fill;
 
 use std::time::Duration;
@@ -27,7 +31,7 @@ use simplelog::{LevelFilter, WriteLogger};
 pub mod db;
 mod scrape;
 
-use db::{new_session, ScyllaSession};
+use db::{delete_product, new_session, ScyllaSession};
 #[derive(Debug, Clone)]
 pub struct Product {
     name: String,
@@ -146,6 +150,7 @@ fn main() -> Result<(), Error> {
             Arg::with_name("remove")
                 .short("r")
                 .long("remove")
+                .takes_value(true)
                 .help("Removes a product from future price scraping"),
         )
         .arg(
@@ -175,7 +180,6 @@ fn main() -> Result<(), Error> {
                 let (name, url): (String, String) = info?;
                 products.push((name, Url::parse(&url)?));
             }
-            dbg!(&products);
             // TODO: think about creating an iterator instead of creating a vector
             let urls = {
                 let mut urls = Vec::new();
@@ -218,10 +222,6 @@ fn main() -> Result<(), Error> {
             product_table.printstd();
             Ok(())
         });
-    // // my_table.printstd();
-    // info!("Table Data:\n{}", my_table.to_string());
-
-    // dbg!(db::get_all_products(&session).await?);
     } else if matches.is_present("product") {
         let url = matches.value_of_os("product").unwrap();
         let url = url.to_string_lossy().to_string();
@@ -263,15 +263,90 @@ fn main() -> Result<(), Error> {
     } else if matches.is_present("plot") {
         let name = matches.value_of("plot").unwrap().to_owned();
         let product_data: Result<Vec<(String, DateTime<Utc>)>, Error> = task::block_on(async {
+            let docker = Docker::connect_with_local_defaults()?;
+
+            let container_name = "scylla";
+            start_docker_container(&docker, container_name).await?;
             let session: ScyllaSession = new_session(ADDR).await?;
             let product_info = db::get_product_prices(&name, &session).await?.unwrap();
-            // dbg!(product_info);
+            dbg!(&product_info);
 
             Ok(product_info)
         });
-        dbg!(product_data?);
-        // search in scylla and get all prices on this product
+        plot_data(&name, &product_data?)?;
+    } else if matches.is_present("remove") {
+        let name = matches.value_of("remove").unwrap().to_owned();
+
+        let conn = Connection::open("products.db")?;
+
+        let mut stmt = conn.prepare("DELETE FROM Products WHERE (name) = (?1)")?;
+        stmt.execute(&[&name])?;
+
+        let docker = Docker::connect_with_local_defaults()?;
+
+        let container_name = "scylla";
+        let res: Result<_, Error> = task::block_on(async {
+            start_docker_container(&docker, container_name).await?;
+            let session: ScyllaSession = new_session(ADDR).await?;
+            db::delete_product(&name, &session).await?;
+            Ok(())
+        });
+        res?;
     }
+
+    Ok(())
+}
+
+fn plot_data(name: &str, data: &[(String, DateTime<Utc>)]) -> Result<(), Error> {
+    if data.is_empty() {
+        bail!("The data for \"{}\" is empty. It cannot be plotted.", name);
+    }
+    let root = SVGBackend::new("plot.svg", (1920, 1080)).into_drawing_area();
+    // root.fill(&WHITE)?;
+
+    let x_axis = {
+        let mut x = Vec::new();
+        for (_, time) in data.iter() {
+            x.push(*time);
+        }
+        x
+    };
+    let y_axis = {
+        let mut y = Vec::new();
+        for (price, _) in data.iter() {
+            y.push(price.clone().parse::<Decimal>()?);
+        }
+        y
+    };
+    let x_min = *x_axis.iter().min().unwrap();
+    let x_max = *x_axis.iter().max().unwrap();
+    let y_max = *y_axis.iter().max().unwrap();
+    let y_max = y_max.to_f64().unwrap() + y_max.to_f64().unwrap() / 2.0;
+
+    let mut chart = ChartBuilder::on(&root)
+        .caption(name, ("sans-serif", 5.percent_height()))
+        .set_label_area_size(LabelAreaPosition::Left, 8.percent())
+        .set_label_area_size(LabelAreaPosition::Bottom, 8.percent())
+        .margin(5.percent())
+        .build_cartesian_2d(x_min..x_max, 0.0..y_max)?;
+
+    let text_style = TextStyle::from(("sans-serif", 18));
+    chart
+        .configure_mesh()
+        .disable_mesh()
+        .x_desc("Time")
+        .y_desc("Price")
+        .axis_desc_style(text_style)
+        .draw()?;
+
+    let line_series = LineSeries::new(
+        x_axis
+            .iter()
+            .zip(y_axis.iter())
+            .map(|(x, y)| (*x, y.to_f64().unwrap())),
+        Palette99::pick(0).mix(0.9).stroke_width(3),
+    );
+    chart.draw_series(line_series)?;
 
     Ok(())
 }
