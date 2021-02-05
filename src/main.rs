@@ -18,11 +18,10 @@ use scrape::{get_product_name, scrape_amazon};
 use style::{Palette99, TextStyle};
 use textwrap::fill;
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use url::Url;
 
-use cdrs_tokio::query::QueryExecutor;
 use cdrs_tokio::types::rows::Row;
 use cdrs_tokio::types::IntoRustByName;
 use log::{debug, error, info, warn};
@@ -31,7 +30,7 @@ use simplelog::{LevelFilter, WriteLogger};
 pub mod db;
 mod scrape;
 
-use db::{delete_product, new_session, ScyllaSession};
+use db::{new_session, ScyllaSession};
 #[derive(Debug, Clone)]
 pub struct Product {
     name: String,
@@ -193,22 +192,36 @@ fn main() -> Result<(), Error> {
 
             // TODO: if docker fails to connect then this should send a desktop notification
             // which should prompt me to start docker and allow the program to run correctly
-            let docker = Docker::connect_with_local_defaults()?;
+            // let docker = Docker::connect_with_local_defaults()?;
 
-            let container_name = "scylla";
-            start_docker_container(&docker, container_name).await?;
+            // let container_name = "scylla";
+            // start_docker_container(&docker, container_name).await?;
 
             // Here goes code to move product data into the database then program should stop container
             // and close docker down if that is possible
 
             // initialize scylla db
-            let session = new_session(ADDR).await?;
-            session.query(db::CREATE_KEYSPACE).await?;
-            session.query(db::CREATE_PRODUCT_TABLE).await?;
+            // let session = new_session(ADDR).await?;
+            // session.query(db::CREATE_KEYSPACE).await?;
+            // session.query(db::CREATE_PRODUCT_TABLE).await?;
 
             let new_products_info = new_products_info.await?;
+
+            let conn = Arc::new(Connection::open("products.db")?);
+
+            conn.execute(
+                "
+            CREATE TABLE IF NOT EXISTS product_prices(
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                url TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                price TEXT NOT NULL
+            )",
+                NO_PARAMS,
+            )?;
             for ((name, url), new_info) in products.iter().zip(new_products_info.iter()) {
-                db::insert_new_product_info(&session, name, url, new_info).await?;
+                db::insert_new_product_info(conn.clone(), name, url, new_info)?;
             }
             let mut product_table = Table::new();
             product_table.add_row(row!["Name", "Price"]);
@@ -282,16 +295,8 @@ fn main() -> Result<(), Error> {
         let mut stmt = conn.prepare("DELETE FROM Products WHERE (name) = (?1)")?;
         stmt.execute(&[&name])?;
 
-        let docker = Docker::connect_with_local_defaults()?;
-
-        let container_name = "scylla";
-        let res: Result<_, Error> = task::block_on(async {
-            start_docker_container(&docker, container_name).await?;
-            let session: ScyllaSession = new_session(ADDR).await?;
-            db::delete_product(&name, &session).await?;
-            Ok(())
-        });
-        res?;
+        let mut stmt = conn.prepare("DELETE FROM product_prices WHERE (name) = (?1)")?;
+        stmt.execute(&[&name])?;
     }
 
     Ok(())
