@@ -1,12 +1,6 @@
 // #![allow(warnings)]
 use anyhow::{bail, Context, Error, Result};
-use async_std::task::{self, sleep};
-use bollard::{
-    container::{Config, CreateContainerOptions, StartContainerOptions},
-    models::ContainerStateStatusEnum,
-};
-use bollard::{service::HostConfig, Docker};
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 
 use clap::{App, Arg};
 use plotters::prelude::{ChartBuilder, IntoDrawingArea, LabelAreaPosition, LineSeries, SVGBackend};
@@ -14,23 +8,20 @@ use plotters::style::{self, AsRelative, Color, Palette};
 use prettytable::{cell, row, Table};
 use rusqlite::{Connection, NO_PARAMS};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
-use scrape::{get_product_name, scrape_amazon};
+use scrape::{get_product_name, scrape_products};
 use style::{Palette99, TextStyle};
 use textwrap::fill;
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use url::Url;
 
-use cdrs_tokio::types::rows::Row;
-use cdrs_tokio::types::IntoRustByName;
 use log::{debug, error, info, warn};
 use simplelog::{LevelFilter, WriteLogger};
 
 pub mod db;
 mod scrape;
 
-use db::{new_session, ScyllaSession};
 #[derive(Debug, Clone)]
 pub struct Product {
     name: String,
@@ -44,53 +35,6 @@ pub struct ProductInfo {
     time: chrono::DateTime<Utc>,
 }
 
-const ADDR: &str = "127.0.0.1:9042";
-
-impl From<Row> for Product {
-    fn from(row: Row) -> Self {
-        let name: String = row.get_by_name("name").unwrap().unwrap();
-        let price = {
-            let price: String = row.get_by_name("price").unwrap().unwrap();
-            match price.as_str() {
-                "Sold Out" => ProductPrice::SoldOut,
-                _ => ProductPrice::Price(price),
-            }
-        };
-        let time = {
-            let time: i64 = row.get_by_name("time").unwrap().unwrap();
-            let new_time = NaiveDateTime::from_timestamp(time, 0);
-            DateTime::<Utc>::from_utc(new_time, Utc)
-        };
-        let url = {
-            let raw_url: String = row.get_by_name("url").unwrap().unwrap();
-            Url::parse(&raw_url).unwrap()
-        };
-        Product {
-            name,
-            url,
-            time,
-            price,
-        }
-    }
-}
-
-impl From<Row> for ProductInfo {
-    fn from(row: Row) -> Self {
-        let price = {
-            let price: String = row.get_by_name("price").unwrap().unwrap();
-            match price.as_str() {
-                "Sold Out" => ProductPrice::SoldOut,
-                _ => ProductPrice::Price(price),
-            }
-        };
-        let time = {
-            let time: i64 = row.get_by_name("time").unwrap().unwrap();
-            let new_time = NaiveDateTime::from_timestamp(time, 0);
-            DateTime::<Utc>::from_utc(new_time, Utc)
-        };
-        ProductInfo { time, price }
-    }
-}
 #[derive(Debug, Clone)]
 enum ProductPrice {
     Price(String),
@@ -169,48 +113,47 @@ fn main() -> Result<(), Error> {
 
     let matches = app.get_matches();
     if matches.is_present("scrape") {
-        let _: Result<_, Error> = task::block_on(async {
-            let conn = Connection::open("products.db")?;
+        let conn = Connection::open("products.db")?;
 
-            let mut stmt = conn.prepare("SELECT name, url FROM products")?;
-            let mut products = Vec::new();
-            let rows = stmt.query_map(NO_PARAMS, |row| Ok((row.get("name")?, row.get("url")?)))?;
-            for info in rows {
-                let (name, url): (String, String) = info?;
-                products.push((name, Url::parse(&url)?));
+        let mut stmt = conn.prepare("SELECT name, url FROM products")?;
+        let mut products = Vec::new();
+        let rows = stmt.query_map(NO_PARAMS, |row| Ok((row.get("name")?, row.get("url")?)))?;
+        for info in rows {
+            let (name, url): (String, String) = info?;
+            products.push((name, Url::parse(&url)?));
+        }
+        // TODO: think about creating an iterator instead of creating a vector
+        let urls = {
+            let mut urls = Vec::new();
+            for (_, url) in products.iter() {
+                urls.push(url.clone());
             }
-            // TODO: think about creating an iterator instead of creating a vector
-            let urls = {
-                let mut urls = Vec::new();
-                for (_, url) in products.iter() {
-                    urls.push(url.clone());
-                }
-                urls
-            };
+            urls
+        };
 
-            let new_products_info = scrape_amazon(&urls);
+        let new_products_info = scrape_products(&urls);
 
-            // TODO: if docker fails to connect then this should send a desktop notification
-            // which should prompt me to start docker and allow the program to run correctly
-            // let docker = Docker::connect_with_local_defaults()?;
+        // TODO: if docker fails to connect then this should send a desktop notification
+        // which should prompt me to start docker and allow the program to run correctly
+        // let docker = Docker::connect_with_local_defaults()?;
 
-            // let container_name = "scylla";
-            // start_docker_container(&docker, container_name).await?;
+        // let container_name = "scylla";
+        // start_docker_container(&docker, container_name).await?;
 
-            // Here goes code to move product data into the database then program should stop container
-            // and close docker down if that is possible
+        // Here goes code to move product data into the database then program should stop container
+        // and close docker down if that is possible
 
-            // initialize scylla db
-            // let session = new_session(ADDR).await?;
-            // session.query(db::CREATE_KEYSPACE).await?;
-            // session.query(db::CREATE_PRODUCT_TABLE).await?;
+        // initialize scylla db
+        // let session = new_session(ADDR).await?;
+        // session.query(db::CREATE_KEYSPACE).await?;
+        // session.query(db::CREATE_PRODUCT_TABLE).await?;
 
-            let new_products_info = new_products_info.await?;
+        let new_products_info = new_products_info?;
 
-            let conn = Arc::new(Connection::open("products.db")?);
+        let conn = Arc::new(Connection::open("products.db")?);
 
-            conn.execute(
-                "
+        conn.execute(
+            "
             CREATE TABLE IF NOT EXISTS product_prices(
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -218,23 +161,21 @@ fn main() -> Result<(), Error> {
                 timestamp TEXT NOT NULL,
                 price TEXT NOT NULL
             )",
-                NO_PARAMS,
-            )?;
-            for ((name, url), new_info) in products.iter().zip(new_products_info.iter()) {
-                db::insert_new_product_info(conn.clone(), name, url, new_info)?;
-            }
-            let mut product_table = Table::new();
-            product_table.add_row(row!["Name", "Price"]);
+            NO_PARAMS,
+        )?;
+        for ((name, url), new_info) in products.iter().zip(new_products_info.iter()) {
+            db::insert_new_product_info(conn.clone(), name, url, new_info)?;
+        }
+        let mut product_table = Table::new();
+        product_table.add_row(row!["Name", "Price"]);
 
-            for ((name, _), product_info) in products.iter().zip(new_products_info.iter()) {
-                product_table.add_row(row![
-                    &fill(name, 65),
-                    &fill(&product_info.price.to_string(), 15)
-                ]);
-            }
-            product_table.printstd();
-            Ok(())
-        });
+        for ((name, _), product_info) in products.iter().zip(new_products_info.iter()) {
+            product_table.add_row(row![
+                &fill(name, 65),
+                &fill(&product_info.price.to_string(), 15)
+            ]);
+        }
+        product_table.printstd();
     } else if matches.is_present("product") {
         let url = matches.value_of_os("product").unwrap();
         let url = url.to_string_lossy().to_string();
@@ -242,26 +183,23 @@ fn main() -> Result<(), Error> {
         let url = Url::parse(&url)
             .with_context(|| format!("The provided url was not valid. Input url was: {}", url))?;
         // takes url and scrapes its web page to get its name
-        let _: Result<(), Error> = task::block_on(async {
-            let name = get_product_name(&url).await?;
-            let conn = Connection::open("products.db")?;
+        let name = get_product_name(&url)?;
+        let conn = Connection::open("products.db")?;
 
-            conn.execute(
-                "
+        conn.execute(
+            "
             CREATE TABLE IF NOT EXISTS Products (
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
                 url TEXT NOT NULL
             )",
-                NO_PARAMS,
-            )?;
+            NO_PARAMS,
+        )?;
 
-            conn.execute(
-                "INSERT INTO Products (name, url) values (?1, ?2)",
-                &[&name, &db_url],
-            )?;
-            Ok(())
-        });
+        conn.execute(
+            "INSERT INTO Products (name, url) values (?1, ?2)",
+            &[&name, &db_url],
+        )?;
     // looks in sqlite database and retrieves all product names
     // prints them out
     } else if matches.is_present("list") {
@@ -275,18 +213,28 @@ fn main() -> Result<(), Error> {
         }
     } else if matches.is_present("plot") {
         let name = matches.value_of("plot").unwrap().to_owned();
-        let product_data: Result<Vec<(String, DateTime<Utc>)>, Error> = task::block_on(async {
-            let docker = Docker::connect_with_local_defaults()?;
-
-            let container_name = "scylla";
-            start_docker_container(&docker, container_name).await?;
-            let session: ScyllaSession = new_session(ADDR).await?;
-            let product_info = db::get_product_prices(&name, &session).await?.unwrap();
-            dbg!(&product_info);
-
-            Ok(product_info)
-        });
-        plot_data(&name, &product_data?)?;
+        let product_data: Vec<(String, DateTime<FixedOffset>)> = {
+            let conn = Connection::open("products.db")?;
+            let mut stmt = conn.prepare(
+                "
+                SELECT price, timestamp 
+                FROM product_prices 
+                WHERE (name) = (?1) 
+                ORDER BY date(timestamp) ASC",
+            )?;
+            let rows =
+                stmt.query_map(&[&name], |row| Ok((row.get("price"), row.get("timestamp"))))?;
+            // let rows = stmt.query_map(NO_PARAMS, |row| row.get("name"))?;
+            rows.map(|row| {
+                let (price, timestamp) = row.unwrap();
+                let (price, timestamp): (String, String) = (price.unwrap(), timestamp.unwrap());
+                dbg!(&price, &timestamp);
+                let timestamp = DateTime::parse_from_rfc3339(&timestamp).unwrap().to_owned();
+                (price, timestamp)
+            })
+            .collect()
+        };
+        plot_data(&name, &product_data)?;
     } else if matches.is_present("remove") {
         let name = matches.value_of("remove").unwrap().to_owned();
 
@@ -302,7 +250,7 @@ fn main() -> Result<(), Error> {
     Ok(())
 }
 
-fn plot_data(name: &str, data: &[(String, DateTime<Utc>)]) -> Result<(), Error> {
+fn plot_data(name: &str, data: &[(String, DateTime<FixedOffset>)]) -> Result<(), Error> {
     if data.is_empty() {
         bail!("The data for \"{}\" is empty. It cannot be plotted.", name);
     }
@@ -353,89 +301,5 @@ fn plot_data(name: &str, data: &[(String, DateTime<Utc>)]) -> Result<(), Error> 
     );
     chart.draw_series(line_series)?;
 
-    Ok(())
-}
-
-async fn start_docker_container(
-    docker: &Docker,
-    container_name: &str,
-) -> Result<(), bollard::errors::Error> {
-    match docker.inspect_container(container_name, None).await {
-        // if found then start container
-        Ok(res) => {
-            // TODO: Container might already be running so handle error
-            // in that case
-            let state = res.state.unwrap();
-            match state.status.unwrap() {
-                ContainerStateStatusEnum::RUNNING => {
-                    debug!(
-                        "Container is already running. Container state is: {}",
-                        state.status.unwrap()
-                    );
-                }
-                ContainerStateStatusEnum::PAUSED | ContainerStateStatusEnum::EXITED => {
-                    docker
-                        .start_container(
-                            container_name,
-                            Some(StartContainerOptions {
-                                detach_keys: "ctrl-^",
-                            }),
-                        )
-                        .await?;
-                    info!("Starting {} container.", container_name);
-                    // wait for container and scylla to start
-                    sleep(Duration::from_secs(30)).await;
-                }
-                // I think this should be unreachable
-                _ => {
-                    error!(
-                        "reached an unreachable state: Container State -> {:?}",
-                        state
-                    );
-                    unreachable!("State should be running or paused");
-                }
-            }
-        }
-        // if err then create a container and start it
-        // handle errors beter
-        Err(err) => {
-            // log error first
-            warn!("Potential issue finding container {}.", container_name);
-            error!("Docker is possibly not currently running. Be sure to start docker before running this program: {}", err);
-
-            let host_config = HostConfig {
-                memory: Some(2_000_000_000),
-                ..Default::default()
-            };
-            let create_container_config: Config<String> = Config {
-                host_config: Some(host_config),
-                image: Some("scylladb/scylla".to_string()),
-                ..Default::default()
-            };
-
-            let res = docker
-                .create_container(
-                    Some(CreateContainerOptions {
-                        name: container_name,
-                    }),
-                    create_container_config,
-                )
-                .await?;
-
-            debug!("Container create response: {:?}\n", res);
-            info!("Creating {} container.", container_name);
-
-            docker
-                .start_container(
-                    container_name,
-                    Some(StartContainerOptions {
-                        detach_keys: "ctrl-^",
-                    }),
-                )
-                .await?;
-            info!("Starting {} container.", container_name);
-            sleep(Duration::from_secs(30)).await;
-        }
-    };
     Ok(())
 }

@@ -10,23 +10,15 @@ prettytable-rs = "0.8.0"
 textwrap = "0.12.1"
 url = "2.2.0"
 anyhow = "1"
-async-std = {version = "1", features = ["attributes", "tokio02", "tokio1"]}
-futures = "0.3.8"
-cdrs-tokio = "2"
 chrono = "0.4"
-reqwest = { version = "0.11", features = ["brotli", "gzip", "native-tls", "cookies"] }
-bollard = "0.9.0"
 simplelog = "0.9.0"
 log = "0.4.14"
 clap = "2"
 rusqlite = { version = "0.24", features=["bundled"] }
 plotters = "0.3.0"
 rust_decimal = "1"
+ureq = { version = "2", features = ["charset"] }
 
-[profile.dev]
-opt-level = 1
-
-[profile.release]
-opt-level = 3
-debug = true
-# lto = true
+[dependencies.http-types]
+version = "2"
+default-features = false

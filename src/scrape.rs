@@ -1,87 +1,74 @@
-use std::time::Duration;
-
 use anyhow::Error;
-use async_std::{future::timeout, task};
 use chrono::{DateTime, Utc};
-use reqwest::{Client, Url};
+use headers::{ACCEPT_LANGUAGE, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, COOKIE, HOST, PRAGMA};
+use http_types::headers::{self, ACCEPT, ACCEPT_ENCODING, USER_AGENT};
 use scraper::{Html, Selector};
+use ureq::{Agent, Request};
+use url::Url;
 
 use crate::{ProductInfo, ProductPrice};
 
-pub async fn scrape_amazon(urls: &[Url]) -> Result<Vec<ProductInfo>, Error> {
-    let products: Vec<ProductInfo> = {
-        let products = scrape_products(urls).await?;
-        products
-    };
-
-    Ok(products)
+fn set_headers(req: Request) -> Request {
+    req.set(
+        ACCEPT.as_str(),
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    )
+    .set(ACCEPT_ENCODING.as_str(), "gzip, deflate, br")
+    .set(ACCEPT_LANGUAGE.as_str(), "en-US,en;q=0.5")
+    .set(CACHE_CONTROL.as_str(), "no-cache")
+    .set(CONNECTION.as_str(), "keep-alive")
+    .set(HOST.as_str(), "www.amazon.com")
+    .set(PRAGMA.as_str(), "no-cache")
+    .set(
+        USER_AGENT.as_str(),
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:86.0) Gecko/20100101 Firefox/86.0",
+        // "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.146 Safari/537.36",
+    )
+    .set(CONTENT_ENCODING.as_str(), "gzip")
+    .set("DNT", "1")
+    .set("TE", "Trailers")
+    .set("Upgrade-Insecure-Requests", "1")
+    // .set(COOKIE.as_str(), "session-id=133-1434407-8387630; session-id-time=2082787201l; ubid-main=134-1085981-1294228; i18n-prefs=USD; session-token=aDNNWpqhuj0lVRZyMkuREjEl9xO0u9xTpvmtkORZi+0VmmKVqTpdInLmg1gwIHSGXtrKusLHSvJw+wusbTHVYnHKL6oXpmLIBDnfHSTzFrmOMSCsNt4A2hgjgw9LY7sizqYiNcYD8aMFylZzrofd9qoi6gdyq2Xfs3zBGiXOTSV38kg4lnEvZ8GYXjtNpJQz; csm-hit=tb:WSQV0YZMJP4ET1SZQ1VH+s-WSQV0YZMJP4ET1SZQ1VH|1612568046536&adb:adblk_no&t:1612568046536")
+    // let headers = {
+    //     // headers.insert(
+    //     //     header::UPGRADE_INSECURE_REQUESTS,
+    //     //     HeaderValue::from_str("1")?,
+    //     // );
+    //     );
+    //     headers
+    // };
+    // client = client.gzip(true);
+    // client = client.brotli(true);
+    // client = client.cookie_store(true);
+    // client = client.default_headers(headers);
+    // client = client.use_native_tls();
+    // client = client.https_only(true);
+    // Ok(client.build()?)
 }
 
-fn client() -> Result<Client, Error> {
-    let mut client = reqwest::ClientBuilder::new();
-    let headers = {
-        use reqwest::header;
-        use reqwest::header::HeaderValue;
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            header::ACCEPT,
-            HeaderValue::from_str(
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            )?,
-        );
-        headers.insert(
-            header::ACCEPT_ENCODING,
-            HeaderValue::from_str("gzip, deflate, br")?,
-        );
-        headers.insert(
-            header::ACCEPT_LANGUAGE,
-            HeaderValue::from_str("en-US,en;q=0.5")?,
-        );
-        headers.insert(header::CACHE_CONTROL, HeaderValue::from_str("no-cache")?);
-        headers.insert(header::CONNECTION, HeaderValue::from_str("keep-alive")?);
-        headers.insert(header::DNT, HeaderValue::from_str("1")?);
-        headers.insert(header::HOST, HeaderValue::from_str("www.amazon.com")?);
-        headers.insert(header::PRAGMA, HeaderValue::from_str("no-cache")?);
-        headers.insert(
-            header::UPGRADE_INSECURE_REQUESTS,
-            HeaderValue::from_str("1")?,
-        );
-        headers
-    };
-    client = client.gzip(true);
-    client = client.brotli(true);
-    client = client.cookie_store(true);
-    client = client.default_headers(headers);
-    client = client.use_native_tls();
-    Ok(client.build()?)
-}
-
-async fn scrape_products(urls: &[Url]) -> Result<Vec<ProductInfo>, Error> {
+pub fn scrape_products(urls: &[Url]) -> Result<Vec<ProductInfo>, Error> {
     let mut products: Vec<ProductInfo> = Vec::new();
 
-    let client = client()?;
+    let agent = ureq::agent();
     let now = Utc::now();
     for url in urls.iter() {
-        let product = timeout(
-            Duration::from_secs(5),
-            task::spawn(scrape_product_price(url.clone(), client.clone(), now)),
-        )
-        .await?;
-        products.push(product?);
+        // let req = ur
+        let product = scrape_product_price(url.clone(), agent.clone(), now)?;
+        products.push(product);
     }
     Ok(products)
 }
 
-async fn scrape_product_price(
+fn scrape_product_price(
     url: Url,
-    client: reqwest::Client,
+    client: Agent,
     time: DateTime<Utc>,
 ) -> Result<ProductInfo, Error> {
-    let req = client.get(url.clone()).build()?;
-    let res = client.execute(req).await?;
-    let document = res.text_with_charset("utf-8").await?;
+    let req = client.get(url.as_str());
+    let req = set_headers(req);
+    let res = req.call()?;
+    let document = res.into_string()?;
 
-    let document = document;
     let document = Html::parse_document(&document);
 
     let price_selector =
@@ -105,13 +92,16 @@ async fn scrape_product_price(
     Ok(product)
 }
 
-pub async fn get_product_name(url: &Url) -> Result<String, Error> {
-    let client = client()?;
-    let req = client.get(url.clone()).build()?;
-    let res = client.execute(req).await?;
-    let document = res.text_with_charset("utf-8").await?;
+pub fn get_product_name(url: &Url) -> Result<String, Error> {
+    let client = ureq::agent();
+    let req = client.get(url.as_str());
+    let req = set_headers(req);
+    let res = req.call()?;
+    // dbg!(&res.charset());
+    let document = res.into_string()?;
+    // dbg!(&document);
+    // println!("{}", &document);
 
-    let document = document;
     let document = Html::parse_document(&document);
 
     let title_selector =
