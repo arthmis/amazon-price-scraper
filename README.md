@@ -5,7 +5,7 @@ over time.
 ## Build & Run
 You will need to install [Rust](https://www.rust-lang.org/) in order to run this project. These are the [installation instructions](https://www.rust-lang.org/learn/get-started).
 
-To run the project:
+To run the project. Type this command in your terminal:
 ```
 cargo run --release
 ```
